@@ -1,0 +1,11 @@
+Priya: Okay, so, um, thanks everyone. Let's kick off the launch planning. Which database do we want, Postgres or MySQL?
+Rahul: I think we go with Postgres. The team already knows it.
+Priya: Postgres it is. And we're launching on November 15th.
+Meera: Sounds good. Let's go with Stripe for payments.
+Priya: We decided to go with the new pricing page for the November release.
+Priya: Rahul, can you draft the architecture doc?
+Rahul: Sure.
+Priya: By next Tuesday please.
+Meera: I'll set up the staging environment by Friday, no wait, Thursday.
+Priya: We need to update the onboarding docs.
+Priya: Thanks all, that's it.

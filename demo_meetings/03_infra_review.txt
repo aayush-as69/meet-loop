@@ -1,0 +1,8 @@
+Rahul: Ops told me they only support MySQL in production. So we're switching to MySQL for the database.
+Priya: Okay. And let's launch on November 15th after all, the security review finished early.
+Meera: Let's hold the new pricing page until the December release, finance wants one more pass.
+Priya: Agreed.
+Meera: I'll update the invoice template by end of next week.
+Priya: Rahul, please migrate the staging data to MySQL.
+Rahul: On it.
+Priya: Thanks everyone.

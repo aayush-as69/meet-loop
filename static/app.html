@@ -1,0 +1,615 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Meetloop</title>
+  <script src="https://cdn.tailwindcss.com/3.4.17"></script>
+</head>
+<body class="bg-slate-50 text-slate-900 antialiased">
+  <header class="border-b border-slate-200 bg-white">
+    <div id="hdr" class="mx-auto max-w-3xl px-4 py-3 flex flex-wrap items-center gap-x-6 gap-y-1">
+      <a href="/" class="font-semibold tracking-tight text-slate-900">Meetloop</a>
+      <nav class="flex gap-4 text-sm" aria-label="Main">
+        <a data-nav="/" href="/" class="text-slate-500 hover:text-slate-900">Meetings</a>
+        <a data-nav="/reminders" href="/reminders" class="text-slate-500 hover:text-slate-900">Reminders</a>
+        <a data-nav="/digest" href="/digest" class="text-slate-500 hover:text-slate-900">Digest</a>
+        <a data-nav="/new" href="/new" class="text-slate-500 hover:text-slate-900">New meeting</a>
+      </nav>
+      <span id="simclock" class="hidden"></span>
+      <span id="crumb" class="ml-auto text-sm text-slate-500"></span>
+    </div>
+  </header>
+
+  <main id="app" class="mx-auto max-w-3xl px-4 py-8 pb-40"></main>
+
+  <!-- Sticky confirm bar (review page only) -->
+  <div id="bar" class="hidden fixed inset-x-0 bottom-0 z-10 border-t border-slate-200 bg-white/95 backdrop-blur">
+    <div class="mx-auto max-w-3xl px-4 py-3">
+      <p id="bar-msg" role="status" class="mb-2 text-sm"></p>
+      <div class="flex items-center justify-between gap-4">
+        <p class="text-xs text-slate-500">One GitHub issue per approved action item. Decisions are never posted.</p>
+        <button id="confirm" type="button"
+                class="shrink-0 rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white shadow-sm hover:bg-slate-700 disabled:cursor-not-allowed disabled:bg-slate-300"></button>
+      </div>
+    </div>
+  </div>
+
+<script>
+// ---------------------------------------------------------------- helpers
+// h() builds elements with textContent only, so transcript text can never inject markup.
+function h(tag, attrs = {}, ...kids) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v === false || v == null) continue;
+    if (k === 'class') el.className = v;
+    else if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
+    else if (v === true) el.setAttribute(k, '');
+    else el.setAttribute(k, v);
+  }
+  for (const kid of kids.flat()) if (kid != null && kid !== false) el.append(kid);
+  return el;
+}
+
+async function api(method, url, body, signal) {
+  const res = await fetch(url, {
+    method,
+    headers: body ? { 'Content-Type': 'application/json' } : {},
+    body: body ? JSON.stringify(body) : undefined,
+    signal,
+  });
+  let data = null;
+  try { data = await res.json(); } catch (_) {}
+  if (!res.ok) throw new Error((data && data.error) || `Request failed (HTTP ${res.status})`);
+  return data;
+}
+
+function fmtDate(iso) {
+  if (!iso) return null;
+  const d = new Date(iso.slice(0, 10) + 'T00:00:00');
+  return isNaN(d) ? iso : d.toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' });
+}
+
+// ?now=YYYY-MM-DD[THH:MM] simulates the clock (demos). It rides along on nav links and API calls.
+const NOW = new URLSearchParams(location.search).get('now');
+const withNow = (url) => NOW ? url + (url.includes('?') ? '&' : '?') + 'now=' + encodeURIComponent(NOW) : url;
+
+const $app = document.getElementById('app');
+const $hdr = document.getElementById('hdr');
+function layout(wide) {                       // wide pages (reminders, digest) get more room
+  for (const [el, base] of [[$app, 'mx-auto px-4 py-8 pb-40'], [$hdr, 'mx-auto px-4 py-3 flex flex-wrap items-center gap-x-6 gap-y-1']])
+    el.className = `${base} ${wide ? 'max-w-6xl' : 'max-w-3xl'}`;
+}
+function setupNav() {
+  const path = location.pathname;
+  const section = path.startsWith('/reminders') ? '/reminders' : path.startsWith('/digest') ? '/digest' : path.startsWith('/new') ? '/new' : '/';
+  document.querySelectorAll('a[data-nav]').forEach(a => {
+    a.href = withNow(a.dataset.nav);
+    const on = a.dataset.nav === section;
+    a.className = on ? 'font-medium text-slate-900 underline underline-offset-8 decoration-2' : 'text-slate-500 hover:text-slate-900';
+    if (on) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
+  });
+  if (NOW) {
+    const c = document.getElementById('simclock');
+    c.className = 'rounded-full bg-violet-100 px-2.5 py-0.5 text-xs font-medium text-violet-800';
+    c.textContent = `Simulated clock: ${NOW}`;
+  }
+}
+const $crumb = document.getElementById('crumb');
+const $bar = document.getElementById('bar');
+const $barMsg = document.getElementById('bar-msg');
+const $confirm = document.getElementById('confirm');
+
+const chip = (text, cls) => h('span', { class: `inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${cls}` }, text);
+const plural = (n, one, many) => `${n} ${n === 1 ? one : (many || one + 's')}`;
+
+// ---------------------------------------------------------------- home: list of meetings
+async function showHome() {
+  layout(false);
+  document.title = 'Meetloop';
+  $app.replaceChildren(h('p', { class: 'text-slate-500' }, 'Loading meetings…'));
+  let meetings;
+  try { meetings = await api('GET', '/api/meetings'); }
+  catch (e) { return $app.replaceChildren(h('p', { class: 'text-rose-700' }, e.message)); }
+
+  const newLink = (cls) => h('a', { href: withNow('/new'), class: cls }, 'New meeting');
+  const head = h('div', { class: 'mb-6 flex items-center justify-between gap-3' },
+    h('h1', { class: 'text-2xl font-semibold tracking-tight' }, 'Meetings'),
+    newLink('rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white shadow-sm hover:bg-slate-700'));
+  if (!meetings.length) {
+    return $app.replaceChildren(head, h('div', { class: 'rounded-xl border border-dashed border-slate-300 bg-white p-8 text-center text-slate-600' },
+      h('p', {}, 'No meetings yet.'),
+      h('p', { class: 'mt-1 text-sm' }, 'Paste a transcript on the ', h('a', { href: withNow('/new'), class: 'font-medium underline' }, 'New meeting'), ' page, or run seed.py to load the demo meetings.')));
+  }
+  const rows = meetings.map(m => h('li', {},
+    h('a', { href: `/meetings/${m.id}`, class: 'block rounded-xl border border-slate-200 bg-white p-4 shadow-sm transition hover:border-slate-400' },
+      h('div', { class: 'flex items-baseline justify-between gap-3' },
+        h('span', { class: 'font-medium' }, m.title),
+        h('span', { class: 'shrink-0 text-sm text-slate-500' }, fmtDate(m.meeting_date) || 'No date')),
+      h('div', { class: 'mt-3 flex flex-wrap gap-2' },
+        chip(plural(m.decisions, 'decision'), 'bg-slate-100 text-slate-700'),
+        chip(plural(m.action_items, 'action item'), 'bg-slate-100 text-slate-700'),
+        chip(`${m.needs_review} need${m.needs_review === 1 ? 's' : ''} review`, m.needs_review ? 'bg-amber-100 text-amber-900' : 'bg-slate-100 text-slate-500'),
+        chip(plural(m.conflicts, 'conflict'), m.conflicts ? 'bg-rose-100 text-rose-800' : 'bg-slate-100 text-slate-500')))));
+  $app.replaceChildren(head, h('ul', { class: 'space-y-3' }, rows));
+}
+
+// ---------------------------------------------------------------- review page
+const SEVERITY = { high: 'bg-rose-600 text-white', medium: 'bg-rose-200 text-rose-900', low: 'bg-rose-100 text-rose-800' };
+
+async function showMeeting(id) {
+  layout(false);
+  $app.replaceChildren(h('p', { class: 'text-slate-500' }, 'Loading meeting…'));
+  let meeting;
+  try { meeting = await api('GET', `/api/meetings/${id}`); }
+  catch (e) {
+    return $app.replaceChildren(h('p', { class: 'text-rose-700' }, e.message), h('a', { href: '/', class: 'mt-4 inline-block text-sm underline' }, 'Back to all meetings'));
+  }
+  document.title = `${meeting.title} · Meetloop`;
+  $crumb.replaceChildren(h('a', { href: '/', class: 'hover:underline' }, '← All meetings'));
+
+  const cards = new Map();           // item id -> card element (with .update(item))
+  const items = new Map(meeting.items.map(i => [i.id, i]));
+  const itemErrors = new Map();      // item id -> message from the last Confirm
+  const inflight = new Set();        // PATCH requests still running (Confirm waits for them)
+  let posting = false;
+
+  const conflictsByItem = new Map();
+  for (const c of meeting.conflicts) conflictsByItem.set(c.item_id, c);
+
+  const approvedCount = () => [...items.values()].filter(i => i.kind === 'action_item' && i.status === 'approved' && !i.posted).length;
+
+  function renderBar(msg, bad) {
+    const n = approvedCount();
+    $confirm.textContent = posting ? 'Posting…' : `Confirm & Post (${n} approved)`;
+    $confirm.disabled = posting || n === 0;
+    if (msg !== undefined) {
+      $barMsg.textContent = msg || '';
+      $barMsg.className = `mb-2 text-sm ${bad ? 'text-rose-700' : 'text-emerald-700'} ${msg ? '' : 'hidden'}`;
+    }
+  }
+
+  // ---- one card
+  function makeCard(initial) {
+    let item = initial;
+    let seq = 0;                      // only the latest PATCH response may update the card
+    const isAction = item.kind === 'action_item';
+    const conflict = conflictsByItem.get(item.id);
+
+    let stateChip = h('span');
+    const conflictBox = conflict ? h('div', { class: 'rounded-t-[10px] border-b border-rose-300 bg-rose-50 px-4 py-3 text-sm text-rose-900', role: 'alert' },
+      h('div', { class: 'flex items-center gap-2 font-semibold' },
+        h('span', { 'aria-hidden': 'true' }, '⚠'), 'Conflicts with an earlier decision',
+        h('span', { class: `ml-auto rounded px-2 py-0.5 text-xs font-semibold uppercase tracking-wide ${SEVERITY[conflict.severity] || SEVERITY.low}` }, `${conflict.severity} severity`)),
+      h('p', { class: 'mt-2' }, h('span', { class: 'font-medium' }, 'Old decision: '), conflict.conflicting_description,
+        h('span', { class: 'text-rose-700' }, ` — ${conflict.conflicting_meeting_title}${conflict.conflicting_meeting_date ? ', ' + fmtDate(conflict.conflicting_meeting_date) : ''}`)),
+      h('p', { class: 'mt-1' }, h('span', { class: 'font-medium' }, 'Reason: '), conflict.reason)) : null;
+
+    const reviewBox = h('div');
+    const msg = h('p', { class: 'hidden text-xs' });
+    const issueBox = h('div');
+
+    const approveBtn = h('button', { type: 'button', onclick: () => setStatus('approved') }, 'Approve');
+    const rejectBtn = h('button', { type: 'button', onclick: () => setStatus('rejected') }, 'Reject');
+
+    const owner = isAction ? h('input', {
+      type: 'text', placeholder: 'Unassigned', maxlength: '100', value: item.owner || '', id: `owner-${item.id}`,
+      class: 'w-full rounded-md border border-slate-300 px-2.5 py-1.5 text-sm focus:border-slate-500 focus:outline-none focus:ring-1 focus:ring-slate-500 disabled:bg-slate-100 disabled:text-slate-500',
+      onchange: e => save({ owner: e.target.value }) }) : null;
+    const deadline = isAction ? h('input', {
+      type: 'date', value: item.deadline || '', id: `deadline-${item.id}`,
+      class: 'w-full rounded-md border border-slate-300 px-2.5 py-1.5 text-sm focus:border-slate-500 focus:outline-none focus:ring-1 focus:ring-slate-500 disabled:bg-slate-100 disabled:text-slate-500',
+      onchange: e => save({ deadline: e.target.value }) }) : null;
+    const deadlineHint = h('p', { class: 'mt-1 text-xs text-slate-500' });
+
+    const label = (text, forId, control, extra) => h('div', {}, h('label', { for: forId, class: 'mb-1 block text-xs font-medium text-slate-600' }, text), control, extra);
+
+    const card = h('article', { class: 'rounded-xl border-2 bg-white shadow-sm' },
+      conflictBox,
+      h('div', { class: 'p-4' },
+        h('div', { class: 'mb-2 flex flex-wrap items-center gap-2' },
+          chip(isAction ? 'Action item' : 'Decision', isAction ? 'bg-indigo-100 text-indigo-800' : 'bg-sky-100 text-sky-800'),
+          !isAction && item.topic ? chip(item.topic, 'bg-slate-100 text-slate-700') : null,
+          h('span', { class: 'ml-auto' }, stateChip)),
+        h('h2', { class: 'text-base font-medium leading-snug' }, item.description),
+        h('blockquote', { class: 'mt-3 border-l-4 border-slate-200 pl-3 text-sm text-slate-600 whitespace-pre-line' },
+          item.source_text, item.speaker ? h('footer', { class: 'mt-1 text-xs text-slate-400' }, `— ${item.speaker}`) : null),
+        reviewBox,
+        isAction ? h('div', { class: 'mt-4 grid gap-3 sm:grid-cols-2' },
+          label('Owner', `owner-${item.id}`, owner),
+          label('Deadline', `deadline-${item.id}`, deadline, deadlineHint)) : null,
+        h('div', { class: 'mt-4 flex flex-wrap items-center gap-2' }, approveBtn, rejectBtn, issueBox),
+        msg));
+
+    function flash(text, bad) {
+      msg.textContent = text || '';
+      msg.className = `mt-2 text-xs ${bad ? 'text-rose-700' : 'text-slate-500'} ${text ? '' : 'hidden'}`;
+    }
+
+    function update(next) {
+      item = next;
+      const locked = item.posted || item.posting;
+      card.classList.toggle('border-amber-400', item.needs_review && !item.posted);
+      card.classList.toggle('border-slate-200', !(item.needs_review && !item.posted));
+
+      reviewBox.replaceChildren();
+      if (item.needs_review && item.review_reasons.length && !item.posted) {
+        reviewBox.append(h('div', { class: 'mt-3 rounded-md bg-amber-50 px-3 py-2 text-sm text-amber-900' },
+          h('p', { class: 'font-medium' }, 'Needs review'),
+          h('ul', { class: 'mt-1 list-disc space-y-0.5 pl-5' }, item.review_reasons.map(r => h('li', {}, r.message)))));
+      }
+
+      stateChip.replaceWith(stateChip = h('span', {}, ...(item.posted ? [chip('Posted', 'bg-emerald-100 text-emerald-800')]
+        : item.status === 'approved' ? [chip('Approved', 'bg-emerald-100 text-emerald-800')]
+        : item.status === 'rejected' ? [chip('Rejected', 'bg-slate-200 text-slate-600')]
+        : [chip('Pending', 'bg-slate-100 text-slate-500')])));
+
+      const btn = (on, onCls) => `rounded-lg border px-3 py-1.5 text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-50 ${on ? onCls : 'border-slate-300 bg-white text-slate-700 hover:bg-slate-50'}`;
+      approveBtn.className = btn(item.status === 'approved', 'border-emerald-600 bg-emerald-600 text-white');
+      rejectBtn.className = btn(item.status === 'rejected', 'border-rose-600 bg-rose-600 text-white');
+      approveBtn.setAttribute('aria-pressed', item.status === 'approved');
+      rejectBtn.setAttribute('aria-pressed', item.status === 'rejected');
+      approveBtn.disabled = rejectBtn.disabled = locked;
+      if (owner) owner.disabled = deadline.disabled = locked;
+
+      // Reflect server-side normalisation without clobbering what's being typed
+      if (owner && document.activeElement !== owner) owner.value = item.owner || '';
+      if (deadline && document.activeElement !== deadline) deadline.value = item.deadline || '';
+      if (isAction) {
+        const bits = [];
+        if (item.deadline_raw) bits.push(`Said: “${item.deadline_raw}”`);
+        if (item.deadline_note) bits.push(item.deadline_note);
+        deadlineHint.textContent = bits.join(' · ');
+      }
+
+      issueBox.replaceChildren();
+      if (item.posted) {
+        issueBox.append(h('a', { href: item.issue_url, target: '_blank', rel: 'noopener noreferrer',
+          class: 'ml-auto inline-flex items-center gap-1 rounded-lg bg-emerald-50 px-3 py-1.5 text-sm font-medium text-emerald-800 hover:bg-emerald-100' },
+          `Issue #${item.issue_number}`, h('span', { 'aria-hidden': 'true' }, '↗')));
+      } else if (item.posting) {
+        issueBox.append(h('span', { class: 'ml-auto text-sm text-slate-500' }, 'Posting…'));
+      }
+      if (itemErrors.has(item.id) && !item.posted) { flash(`Couldn't post: ${itemErrors.get(item.id)}`, true); msg.dataset.post = '1'; }
+      else if (msg.dataset.post) { flash(''); delete msg.dataset.post; }     // a retry worked: drop the old error
+    }
+
+    async function save(patch) {
+      const mine = ++seq;
+      flash('Saving…');
+      const req = api('PATCH', `/api/items/${item.id}`, patch);
+      inflight.add(req);
+      try {
+        const next = await req;
+        if (mine === seq) { items.set(next.id, next); itemErrors.delete(next.id); flash(''); update(next); renderBar(); }
+      } catch (e) {
+        if (mine === seq) {
+          flash(e.message, true);
+          update(item);                                  // snap the inputs back to what the server has
+          if (owner) { owner.value = item.owner || ''; deadline.value = item.deadline || ''; }
+        }
+      } finally { inflight.delete(req); }
+    }
+
+    function setStatus(s) { save({ status: item.status === s ? 'pending' : s }); }   // click again to undo
+
+    card.update = update;
+    update(item);
+    return card;
+  }
+
+  // ---- page
+  const conflictCount = meeting.conflicts.length;
+  let carried = [];
+  try { carried = JSON.parse(sessionStorage.getItem(`meetloop-warnings-${id}`) || '[]'); } catch (_) {}
+  const warnBox = carried.length ? h('section', { class: 'mb-6 rounded-xl border border-amber-300 bg-amber-50 p-4 text-amber-900', role: 'status' },
+    h('div', { class: 'flex items-start justify-between gap-3' },
+      h('h2', { class: 'font-semibold' }, 'Heads up from the extraction'),
+      h('button', { type: 'button', class: 'text-sm underline', onclick: () => {
+        try { sessionStorage.removeItem(`meetloop-warnings-${id}`); } catch (_) {}
+        warnBox.remove(); } }, 'Dismiss')),
+    h('ul', { class: 'mt-2 list-disc space-y-1 pl-5 text-sm' }, carried.map(w => h('li', {}, w)))) : null;
+  const banner = conflictCount ? h('section', { class: 'mb-6 rounded-xl border border-rose-300 bg-rose-50 p-4 text-rose-900', role: 'alert' },
+    h('h2', { class: 'font-semibold' }, `⚠ ${plural(conflictCount, 'decision')} in this meeting ${conflictCount === 1 ? 'conflicts' : 'conflict'} with earlier ones`),
+    h('ul', { class: 'mt-2 space-y-1 text-sm' }, meeting.conflicts.map(c => h('li', {},
+      chip(c.severity, SEVERITY[c.severity] || SEVERITY.low), ' ', c.description,
+      h('span', { class: 'text-rose-700' }, ` (was: ${c.conflicting_description})`))))) : null;
+
+  const nReview = meeting.items.filter(i => i.needs_review).length;
+  $app.replaceChildren(
+    h('div', { class: 'mb-6' },
+      h('h1', { class: 'text-2xl font-semibold tracking-tight' }, meeting.title),
+      h('p', { class: 'mt-1 text-sm text-slate-500' },
+        [fmtDate(meeting.meeting_date) || 'No date',
+         plural(meeting.items.filter(i => i.kind === 'decision').length, 'decision'),
+         plural(meeting.items.filter(i => i.kind === 'action_item').length, 'action item'),
+         nReview ? `${nReview} need review` : null].filter(Boolean).join(' · '))),
+    warnBox,
+    banner,
+    meeting.items.length
+      ? h('div', { class: 'space-y-4' }, meeting.items.map(i => { const c = makeCard(i); cards.set(i.id, c); return c; }))
+      : h('p', { class: 'rounded-xl border border-dashed border-slate-300 bg-white p-8 text-center text-slate-600' }, 'No decisions or action items were extracted from this meeting.'));
+
+  // ---- confirm & post
+  $bar.classList.remove('hidden');
+  $confirm.onclick = async () => {
+    if (posting || approvedCount() === 0) return;
+    posting = true; renderBar('');
+    try {
+      await Promise.allSettled([...inflight]);          // let any edit finish saving first
+      if (approvedCount() === 0) throw new Error('Nothing approved to post.');
+      const r = await api('POST', `/api/meetings/${id}/confirm`);
+      itemErrors.clear();
+      r.errors.forEach(e => itemErrors.set(e.item_id, e.error));
+      const fresh = await api('GET', `/api/meetings/${id}`);
+      fresh.items.forEach(i => { items.set(i.id, i); cards.get(i.id)?.update(i); });
+      const parts = [];
+      if (r.posted.length) parts.push(`Posted ${plural(r.posted.length, 'issue')} to GitHub.`);
+      if (r.skipped.length) parts.push(`${plural(r.skipped.length, 'item')} already posted, skipped.`);
+      if (r.errors.length) parts.push(`${plural(r.errors.length, 'item')} failed — see the card${r.errors.length === 1 ? '' : 's'}; approve stays on, so you can retry.`);
+      posting = false;
+      renderBar(parts.join(' ') || 'Nothing to post.', r.errors.length > 0);
+    } catch (e) {
+      posting = false;
+      renderBar(e.message, true);
+    }
+  };
+  renderBar('');
+}
+
+
+// ---------------------------------------------------------------- reminders
+const KIND = { h24: ['24h before', 'bg-amber-100 text-amber-900'], h1: ['1h before', 'bg-orange-200 text-orange-900'], overdue: ['Overdue', 'bg-rose-100 text-rose-800'] };
+
+function relTime(min) {
+  const a = Math.abs(min), t = a >= 2880 ? `${Math.round(a / 1440)}d` : a >= 90 ? `${Math.round(a / 60)}h` : `${a}m`;
+  return min < 0 ? `${t} overdue` : `due in ${t}`;
+}
+const issueLink = (x) => h('a', { href: x.issue_url, target: '_blank', rel: 'noopener noreferrer', class: 'text-indigo-700 hover:underline' }, `#${x.issue_number}`);
+
+async function showReminders() {
+  layout(true);
+  document.title = 'Reminders · Meetloop';
+  const msg = h('p', { role: 'status', class: 'mb-4 hidden text-sm' });
+  const cols = h('div', { class: 'grid gap-6 lg:grid-cols-3' });
+  const runBtn = h('button', { type: 'button', class: 'rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium hover:bg-slate-50 disabled:opacity-50',
+    onclick: async () => {
+      runBtn.disabled = true;
+      try {
+        const r = await api('POST', withNow('/api/reminders/run'));
+        say(r.fired.length ? `Fired ${plural(r.fired.length, 'reminder')} (checked ${r.checked}).` : `Nothing new to fire (checked ${r.checked}).`);
+        await load();
+      } catch (e) { say(e.message, true); } finally { runBtn.disabled = false; }
+    } }, 'Run reminder check now');
+  $app.replaceChildren(
+    h('div', { class: 'mb-6 flex flex-wrap items-center justify-between gap-3' },
+      h('h1', { class: 'text-2xl font-semibold tracking-tight' }, 'Reminders'), runBtn),
+    msg, cols);
+
+  function say(text, bad) { msg.textContent = text; msg.className = `mb-4 text-sm ${bad ? 'text-rose-700' : 'text-emerald-700'}`; }
+
+  const column = (title, tone, count, body) => h('section', { class: 'min-w-0' },
+    h('h2', { class: `mb-3 flex items-center gap-2 text-sm font-semibold uppercase tracking-wide ${tone}` }, title, chip(String(count), 'bg-slate-100 text-slate-600')),
+    h('div', { class: 'space-y-3' }, body));
+
+  const taskCard = (x, border, tag) => h('article', { class: `rounded-xl border-l-4 border border-slate-200 bg-white p-3 shadow-sm ${border}` },
+    h('p', { class: 'font-medium leading-snug' }, x.description),
+    h('p', { class: 'mt-1 text-sm text-slate-600' }, `${x.owner || 'Unassigned'} · ${fmtDate(x.deadline)} · `, issueLink(x)),
+    h('div', { class: 'mt-2 flex items-center justify-between gap-2' },
+      chip(tag || relTime(x.due_in_minutes), border.includes('rose') ? 'bg-rose-100 text-rose-800' : 'bg-amber-100 text-amber-900'),
+      h('button', { type: 'button', class: 'text-sm text-slate-600 underline hover:text-slate-900',
+        onclick: async () => { try { await api('POST', withNow(`/api/items/${x.id}/done`)); await load(); } catch (e) { say(e.message, true); } } }, 'Mark done')));
+
+  const empty = (t) => h('p', { class: 'rounded-xl border border-dashed border-slate-300 p-4 text-sm text-slate-500' }, t);
+
+  async function load() {
+    const [up, log] = await Promise.all([api('GET', withNow('/api/upcoming')), api('GET', '/api/reminders')]);
+    const soon = [...up.due_1h, ...up.due_24h];
+    cols.replaceChildren(
+      column('Overdue', 'text-rose-700', up.overdue.length,
+        up.overdue.length ? up.overdue.map(x => taskCard(x, 'border-l-rose-500')) : empty('Nothing overdue.')),
+      column('Due in 24h', 'text-amber-700', soon.length,
+        soon.length ? soon.map(x => taskCard(x, 'border-l-amber-400')) : empty('Nothing due in the next 24 hours.')),
+      column('Fired log', 'text-slate-600', log.length,
+        log.length ? log.map(r => h('article', { class: 'rounded-xl border border-slate-200 bg-white p-3 text-sm shadow-sm' },
+          h('div', { class: 'flex items-center justify-between gap-2' }, chip(KIND[r.kind][0], KIND[r.kind][1]),
+            h('time', { class: 'text-xs text-slate-500' }, r.fired_at.replace('T', ' ').slice(0, 16))),
+          h('p', { class: 'mt-1.5 font-medium leading-snug' }, r.description),
+          h('p', { class: 'mt-0.5 text-slate-600' }, `${r.owner || 'Unassigned'} · `, issueLink(r), r.done_at ? ' · done' : '')))
+        : empty('No reminders have fired yet.')));
+  }
+  try { await load(); } catch (e) { cols.replaceChildren(h('p', { class: 'text-rose-700' }, e.message)); }
+}
+
+// ---------------------------------------------------------------- digest
+function openModal(title, text) {
+  const prev = document.activeElement;
+  const close = () => { overlay.remove(); document.removeEventListener('keydown', onKey); prev && prev.focus(); };
+  const onKey = (e) => { if (e.key === 'Escape') close(); };
+  const closeBtn = h('button', { type: 'button', class: 'rounded-lg border border-slate-300 px-3 py-1.5 text-sm font-medium hover:bg-slate-50', onclick: close }, 'Close');
+  const overlay = h('div', { class: 'fixed inset-0 z-20 flex items-center justify-center bg-slate-900/50 p-4', onclick: (e) => e.target === overlay && close() },
+    h('div', { role: 'dialog', 'aria-modal': 'true', 'aria-label': title, class: 'flex max-h-[85vh] w-full max-w-2xl flex-col rounded-xl bg-white shadow-xl' },
+      h('div', { class: 'border-b border-slate-200 px-5 py-3' },
+        h('p', { class: 'text-xs uppercase tracking-wide text-slate-500' }, 'Email preview'),
+        h('p', { class: 'font-medium' }, title)),
+      h('pre', { class: 'overflow-auto whitespace-pre-wrap px-5 py-4 font-mono text-sm text-slate-800' }, text),
+      h('div', { class: 'flex justify-end border-t border-slate-200 px-5 py-3' }, closeBtn)));
+  document.body.append(overlay);
+  document.addEventListener('keydown', onKey);
+  closeBtn.focus();
+}
+
+async function showDigest() {
+  layout(true);
+  document.title = 'Digest · Meetloop';
+  $app.replaceChildren(h('p', { class: 'text-slate-500' }, 'Loading digest…'));
+  let d;
+  try { d = await api('GET', withNow('/api/digest')); } catch (e) { return $app.replaceChildren(h('p', { class: 'text-rose-700' }, e.message)); }
+
+  const head = h('div', { class: 'mb-6' },
+    h('h1', { class: 'text-2xl font-semibold tracking-tight' }, 'Weekly digest'),
+    h('p', { class: 'mt-1 text-sm text-slate-500' }, `As of ${d.now.replace('T', ' ').slice(0, 16)}`));
+  if (!d.people.length) {
+    return $app.replaceChildren(head, h('p', { class: 'rounded-xl border border-dashed border-slate-300 bg-white p-8 text-center text-slate-600' },
+      'Nothing to report yet. Items appear here once they are approved and posted to GitHub.'));
+  }
+
+  const section = (title, tone, rows, render) => h('section', { class: 'mt-4' },
+    h('h3', { class: `text-xs font-semibold uppercase tracking-wide ${tone}` }, `${title} (${rows.length})`),
+    rows.length ? h('ul', { class: 'mt-1.5 space-y-1.5 text-sm' }, rows.map(render)) : h('p', { class: 'mt-1 text-sm text-slate-400' }, 'Nothing.'));
+  const task = (extra) => (x) => h('li', {}, x.description, ' ', issueLink(x), h('span', { class: 'text-slate-500' }, ` — ${extra(x)}`));
+
+  const card = (p) => h('article', { class: 'rounded-xl border border-slate-200 bg-white p-5 shadow-sm' },
+    h('div', { class: 'flex items-center justify-between gap-3' },
+      h('h2', { class: 'text-lg font-semibold' }, p.name),
+      h('button', { type: 'button', class: 'rounded-lg border border-slate-300 px-3 py-1.5 text-sm font-medium hover:bg-slate-50',
+        onclick: async (e) => {
+          const b = e.currentTarget; b.disabled = true;
+          try { const r = await api('GET', withNow(`/api/digest/${encodeURIComponent(p.name)}/preview`)); openModal(r.subject, r.body); }
+          catch (err) { openModal('Could not build the preview', err.message); } finally { b.disabled = false; }
+        } }, 'Preview'),),
+    section('Overdue', 'text-rose-700', p.overdue, task(x => `due ${fmtDate(x.deadline)}`)),
+    section('Due in the next 7 days', 'text-amber-700', p.due_soon, task(x => `due ${fmtDate(x.deadline)}`)),
+    section('Done in the last 7 days', 'text-emerald-700', p.done, task(x => `done ${fmtDate(x.done_at)}`)),
+    section('New decisions', 'text-sky-700', p.new_decisions, x => h('li', {}, x.description,
+      h('span', { class: 'text-slate-500' }, ` — ${x.meeting_title}, ${fmtDate(x.meeting_date)}`))));
+  $app.replaceChildren(head, h('div', { class: 'grid gap-5 md:grid-cols-2' }, d.people.map(card)));
+}
+
+
+// ---------------------------------------------------------------- new meeting
+// Turn a WebVTT / SRT caption file into "Name: sentence" lines. Handles <v Name> voice tags and
+// plain "Name: text" cues; cue text with no speaker continues the previous speaker's line.
+function vttToText(src) {
+  const out = [];
+  let inCue = false;
+  const hasSpeaker = (l) => /^[^:\n]{1,40}:\s/.test(l);
+  for (const raw of src.replace(/^﻿/, '').replace(/\r\n?/g, '\n').split('\n')) {
+    const line = raw.trim();
+    if (!line) { inCue = false; continue; }               // a blank line ends a cue (or header/NOTE/STYLE block)
+    if (line.includes('-->')) { inCue = true; continue; }  // timing line; header, ids and NOTE blocks are never "in a cue"
+    if (!inCue) continue;
+    const text = line.replace(/<v(?:\.[^\s>]+)*\s+([^>]+)>/i, '$1: ').replace(/<[^>]+>/g, '')
+      .replace(/&nbsp;/g, ' ').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&').trim();
+    if (!text) continue;
+    if (out.length && !hasSpeaker(text) && hasSpeaker(out[out.length - 1])) out[out.length - 1] += ' ' + text;
+    else out.push(text);
+  }
+  return out.join('\n');
+}
+
+function todayLocal() {                                   // local calendar date, not UTC
+  const d = new Date(), p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+function showNew() {
+  layout(false);
+  document.title = 'New meeting · Meetloop';
+  const MAX = 1_000_000;                                   // the API's limit
+  const field = 'w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:border-slate-500 focus:outline-none focus:ring-1 focus:ring-slate-500 disabled:bg-slate-100';
+
+  const title = h('input', { type: 'text', id: 'title', maxlength: '200', placeholder: 'e.g. Launch kickoff', class: field });
+  const date = h('input', { type: 'date', id: 'date', value: todayLocal(), class: field });
+  const box = h('textarea', { id: 'transcript', rows: '16', spellcheck: 'false',
+    placeholder: "Priya: Let's go with Postgres for the database.\nRahul: I'll draft the architecture doc by Friday.",
+    class: `${field} font-mono leading-relaxed` });
+  const fileInput = h('input', { type: 'file', accept: '.txt,.vtt,text/plain,text/vtt', class: 'hidden', 'aria-label': 'Choose a transcript file' });
+  const note = h('p', { class: 'mt-1 text-xs text-slate-500', role: 'status' });
+  const status = h('div', { role: 'status', 'aria-live': 'polite', class: 'hidden' });
+  const spinner = h('span', { class: 'hidden h-4 w-4 animate-spin rounded-full border-2 border-white/40 border-t-white', 'aria-hidden': 'true' });
+  const btnLabel = h('span', {}, 'Extract');
+  const submit = h('button', { type: 'submit', class: 'inline-flex items-center gap-2 rounded-lg bg-slate-900 px-5 py-2.5 text-sm font-medium text-white shadow-sm hover:bg-slate-700 disabled:cursor-not-allowed disabled:bg-slate-400' }, spinner, btnLabel);
+
+  function show(kind, text) {                               // kind: error | busy | ok
+    const tone = { error: 'border-rose-300 bg-rose-50 text-rose-800', busy: 'border-sky-200 bg-sky-50 text-sky-900', ok: 'border-emerald-200 bg-emerald-50 text-emerald-900' }[kind];
+    status.className = `rounded-lg border px-3 py-2 text-sm ${tone}`;
+    status.replaceChildren(...(Array.isArray(text) ? text : [text]));
+  }
+
+  async function loadFile(file) {
+    if (!file) return;
+    const ext = (file.name.split('.').pop() || '').toLowerCase();
+    if (!['txt', 'vtt'].includes(ext)) return show('error', `“${file.name}” isn't a .txt or .vtt file.`);
+    if (file.size > MAX) return show('error', `“${file.name}” is over the 1 MB limit.`);
+    let text;
+    try { text = await file.text(); } catch (_) { return show('error', `Couldn't read “${file.name}”.`); }
+    const replaced = box.value.trim() !== '';
+    box.value = ext === 'vtt' ? vttToText(text) : text.replace(/^﻿/, '').replace(/\r\n?/g, '\n');
+    if (!box.value.trim()) return show('error', `“${file.name}” has no text in it.`);
+    if (!title.value.trim()) title.value = file.name.replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ').trim();
+    status.className = 'hidden';
+    note.textContent = `Loaded ${file.name}${ext === 'vtt' ? ' (captions converted to Name: sentence lines)' : ''}${replaced ? ' — replaced what was in the box' : ''}.`;
+  }
+
+  // drag & drop onto the box
+  const over = (on) => ['ring-2', 'ring-indigo-400', 'bg-indigo-50'].forEach(c => box.classList.toggle(c, on));
+  for (const ev of ['dragenter', 'dragover']) box.addEventListener(ev, (e) => { e.preventDefault(); over(true); });
+  box.addEventListener('dragleave', () => over(false));
+  box.addEventListener('drop', (e) => { e.preventDefault(); over(false); loadFile(e.dataTransfer.files[0]); });
+  // a miss must not make the browser navigate away to the dropped file
+  for (const ev of ['dragover', 'drop']) window.addEventListener(ev, (e) => e.preventDefault());
+  fileInput.addEventListener('change', () => { loadFile(fileInput.files[0]); fileInput.value = ''; });
+
+  let busy = false;
+  function setBusy(on) {
+    busy = on;
+    for (const el of [title, date, box, submit]) el.disabled = on;
+    spinner.classList.toggle('hidden', !on);
+    btnLabel.textContent = on ? 'Extracting…' : 'Extract';
+  }
+
+  const form = h('form', { class: 'space-y-5', novalidate: true, onsubmit: async (e) => {
+    e.preventDefault();
+    if (busy) return;
+    if (!box.value.trim()) { show('error', 'Paste or drop a transcript first.'); return box.focus(); }
+    if (new Blob([box.value]).size > MAX) return show('error', 'That transcript is over the 1 MB limit.');
+    setBusy(true);
+    show('busy', ['Reading the transcript… ', h('span', { class: 'text-sky-700' }, 'this can take 10–30 seconds when the AI is involved. Please keep this tab open.')]);
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 180000);
+    try {
+      const body = { transcript: box.value, title: title.value.trim() || undefined, meeting_date: date.value || undefined };
+      const r = await api('POST', '/api/extract', body, ctl.signal);
+      if (r.warnings && r.warnings.length) {
+        try { sessionStorage.setItem(`meetloop-warnings-${r.id}`, JSON.stringify(r.warnings)); } catch (_) {}
+      }
+      show('ok', `Done — found ${plural(r.items.filter(i => i.kind === 'decision').length, 'decision')} and ${plural(r.items.filter(i => i.kind === 'action_item').length, 'action item')}. Opening the review page…`);
+      location.assign(withNow(`/meetings/${r.id}`));
+    } catch (err) {
+      setBusy(false);
+      show('error', err.name === 'AbortError'
+        ? 'This is taking longer than 3 minutes. It may still finish on the server: check the Meetings list before trying again.'
+        : err.message);
+    } finally { clearTimeout(timer); }
+  } },
+    h('div', { class: 'grid gap-4 sm:grid-cols-[1fr_12rem]' },
+      h('div', {}, h('label', { for: 'title', class: 'mb-1 block text-sm font-medium' }, 'Title'), title),
+      h('div', {}, h('label', { for: 'date', class: 'mb-1 block text-sm font-medium' }, 'Meeting date'), date)),
+    h('div', {},
+      h('div', { class: 'mb-1 flex items-center justify-between gap-3' },
+        h('label', { for: 'transcript', class: 'text-sm font-medium' }, 'Transcript'),
+        h('button', { type: 'button', class: 'text-sm text-slate-600 underline hover:text-slate-900', onclick: () => fileInput.click() }, 'Choose a .txt or .vtt file')),
+      box,
+      h('p', { class: 'mt-1 text-xs text-slate-500' }, 'One speaker per line, like “Priya: …”. You can also drop a .txt or .vtt file onto the box.'),
+      note, fileInput),
+    status,
+    h('div', {}, submit));
+
+  $app.replaceChildren(
+    h('h1', { class: 'mb-6 text-2xl font-semibold tracking-tight' }, 'New meeting'), form);
+  box.focus();
+}
+
+// ---------------------------------------------------------------- router
+setupNav();
+const path = location.pathname.replace(/\/+$/, '') || '/';
+const m = path.match(/^\/meetings\/(\d+)$/);
+if (m) showMeeting(Number(m[1]));
+else if (path === '/reminders') showReminders();
+else if (path === '/digest') showDigest();
+else if (path === '/new') showNew();
+else showHome();
+</script>
+</body>
+</html>

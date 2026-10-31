@@ -1,0 +1,9 @@
+Priya: Okay, so, um, thanks everyone. Let's go over the launch. We decided to go with the new pricing page for the November release.
+Rahul: Yeah, I'll, uh, I'll send the updated deck to the client by Friday, no, the date is on Thursday.
+Priya: Sounds good. Meera, can you can you book the demo environment?
+Meera: Sure, I'll do it by next Friday.
+Priya: We need to update the onboarding docs.
+Rahul: Priya will review the legal copy by end of next week.
+Priya: Let's go with Stripe for payments. Dev to set up the sandbox account on November 9th.
+Meera: I'll also follow up with finance about the invoice template.
+Priya: Thanks all, that's it.

@@ -1,0 +1,8 @@
+Priya: Quick update. The security review is running late, so let's push launch to December 1st.
+Rahul: Agreed. And we're sticking with Postgres.
+Meera: Honestly I'd rather use Adyen for payments, the EU fees are better.
+Priya: Fine, let's go with Adyen for payments.
+Priya: Meera, can you book the demo environment?
+Meera: Got it.
+Rahul: I'll send the revised timeline to the client by Friday, no, the date is on Thursday.
+Priya: Great, that's it for today.
