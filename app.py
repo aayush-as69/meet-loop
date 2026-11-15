@@ -118,6 +118,7 @@ def create_app(db_path: str | None = None) -> Flask:
         return dt.replace(microsecond=0)
 
     @app.get("/")
+    @app.get("/meetings")
     @app.get("/meetings/<int:meeting_id>")
     @app.get("/reminders")
     @app.get("/digest")
